@@ -1,0 +1,1022 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MTConnect CNC Digital Twin</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, "Segoe UI", sans-serif; background: #d9dee4; color: #1d232b; overflow: hidden; }
+  #view { position: fixed; inset: 0; }
+  #panel {
+    position: fixed; top: 12px; left: 12px; width: 350px; max-height: calc(100vh - 24px); overflow: auto;
+    background: rgba(255,255,255,0.94); border: 1px solid #c3cad3; border-radius: 10px; padding: 14px; font-size: 13px;
+    box-shadow: 0 6px 24px rgba(30,40,60,0.15);
+  }
+  #panel h1 { font-size: 16px; margin: 0 0 2px; }
+  #panel h2 { font-size: 11px; margin: 14px 0 5px; color: #5b6878; text-transform: uppercase; letter-spacing: .06em; }
+  .sub { color: #5b6878; font-size: 12px; margin-bottom: 8px; }
+  label { display: block; margin: 6px 0 2px; color: #5b6878; font-size: 12px; }
+  input, select, button { width: 100%; padding: 6px 8px; background: #fff; color: #1d232b; border: 1px solid #b9c2cd; border-radius: 6px; font: inherit; }
+  button { cursor: pointer; background: #f1f3f6; }
+  button:hover { background: #e6eaef; }
+  .row { display: flex; gap: 6px; margin-top: 6px; }
+  .row button { flex: 1; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  td { padding: 5px 2px; border-bottom: 1px solid #e3e7ec; vertical-align: top; }
+  .val { text-align: right; font-family: ui-monospace, Consolas, monospace; white-space: nowrap; }
+  .muted { color: #6b7786; font-size: 11px; line-height: 1.35; }
+  .bar { height: 4px; background: #e3e7ec; border-radius: 2px; margin-top: 4px; position: relative; }
+  .bar i { position: absolute; top: -2px; width: 3px; height: 8px; border-radius: 1px; background: #1d232b; }
+  #status { margin-top: 8px; font-size: 12px; }
+  .ok { color: #1a7f37; } .err { color: #c62828; } .warn { color: #b26a00; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font-size: 12px; }
+  .kv span:nth-child(odd) { color: #6b7786; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="view"></div>
+<div id="panel">
+  <h1>CNC Digital Twin</h1>
+  <div class="sub">Built from the MTConnect probe, driven by live observations</div>
+  <label>Agent URL</label>
+  <input id="agentUrl">
+  <label>Device</label>
+  <select id="deviceSel"></select>
+  <div class="row">
+    <button id="connectBtn">Reconnect</button>
+    <button id="trailBtn">Tool path: on</button>
+    <button id="viewBtn">Reset view</button>
+  </div>
+  <div id="status" class="muted">Not connected</div>
+
+  <h2>Machine (from probe)</h2>
+  <div id="deviceInfo" class="kv"></div>
+
+  <h2>Safety check</h2>
+  <div id="safety" class="kv"></div>
+
+  <h2>Axes</h2>
+  <table id="axisTable"><tbody></tbody></table>
+
+  <h2>Coordinate systems</h2>
+  <div id="coordInfo" class="muted">-</div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+/* =====================================================================
+   1. CONFIG  (nothing here names a device, a data item or an axis set)
+   ===================================================================== */
+const params = new URLSearchParams(location.search);
+const DEFAULT_AGENT = params.get('agent') || (location.port ? `${location.origin}/agent` : 'https://demo.metalogi.io');
+const POLL_MS = Number(params.get('poll') || 400);
+const PLAYBACK_DELAY = POLL_MS + 450;       // ms behind live, so we can interpolate between real samples
+const SPIN_SCALE = 0.02;                    // spindles are drawn slowed down so rotation is visible
+const $ = id => document.getElementById(id);
+$('agentUrl').value = DEFAULT_AGENT;
+const V3 = THREE.Vector3;
+
+/* =====================================================================
+   2. MTCONNECT HELPERS
+   ===================================================================== */
+async function fetchXml(url) {
+  const res = await fetch(url, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const doc = new DOMParser().parseFromString(await res.text(), 'application/xml');
+  if (doc.getElementsByTagName('parsererror').length) throw new Error('Bad XML from ' + url);
+  return doc;
+}
+const byTag = (node, tag) => Array.from(node.getElementsByTagNameNS('*', tag));
+const kids = (node, tag) => Array.from(node.children).filter(c => !tag || c.localName === tag);
+const vec3 = text => { const v = (text || '').trim().split(/\s+/).map(Number); return v.length === 3 && !v.some(isNaN) ? v : null; };
+const num = text => { const n = parseFloat(text); return isFinite(n) ? n : null; };
+function ownDataItems(comp) { const di = kids(comp, 'DataItems')[0]; return di ? kids(di, 'DataItem') : []; }
+
+/* =====================================================================
+   3. DISCOVERY: probe -> axes, units, coordinate systems, kinematics, limits
+   ===================================================================== */
+// Only used when the probe gives no <Motion><Axis> vector (ISO 841 letters).
+const NAME_VEC = { X: [1,0,0], U: [1,0,0], Y: [0,1,0], V: [0,1,0], Z: [0,0,1], W: [0,0,1], A: [1,0,0], B: [0,1,0], C: [0,0,1] };
+
+function coordSystems(deviceEl) {
+  const map = {};
+  for (const cs of byTag(deviceEl, 'CoordinateSystem')) {
+    map[cs.getAttribute('id')] = { id: cs.getAttribute('id'), type: cs.getAttribute('type') || '',
+      parent: cs.getAttribute('parentIdRef'), t: vec3(byTag(cs, 'Translation')[0]?.textContent) || [0,0,0] };
+  }
+  return map;
+}
+// Translation of a coordinate system relative to the base, following parentIdRef
+function csOffset(cs, id) { const t = [0,0,0]; let n = 0; while (id && cs[id] && n++ < 10) { cs[id].t.forEach((v, i) => t[i] += v); id = cs[id].parent; } return t; }
+
+function discover(deviceEl) {
+  const cs = coordSystems(deviceEl);
+  const csTypeOf = d => d.getAttribute('coordinateSystem') || cs[d.getAttribute('coordinateSystemIdRef')]?.type || '';
+  const pick = (items, type) => {
+    const c = items.filter(d => d.getAttribute('type') === type && d.getAttribute('category') !== 'CONDITION');
+    const score = d => { const sub = d.getAttribute('subType'), t = csTypeOf(d);
+      return (sub === 'ACTUAL' ? 4 : !sub ? 2 : sub === 'COMMANDED' ? 1 : 0) + (t === 'MACHINE' ? 2 : !t ? 1 : 0); };
+    return c.sort((a, b) => score(b) - score(a))[0] || null;
+  };
+
+  const axes = [];
+  for (const comp of byTag(deviceEl, '*')) {
+    const tag = comp.localName;
+    if (tag !== 'Linear' && tag !== 'Rotary') continue;
+    const kind = tag === 'Linear' ? 'linear' : 'rotary';
+    const items = ownDataItems(comp);
+    const name = comp.getAttribute('name') || comp.getAttribute('nativeName') || comp.getAttribute('id');
+    const pos = pick(items, kind === 'linear' ? 'POSITION' : 'ANGLE');
+    const vel = pick(items, 'ROTARY_VELOCITY');
+    const role = kind === 'linear' ? 'linear' : (pos ? 'rotary' : 'spindle');
+    const item = pos || (role === 'spindle' ? vel : null);
+    if (!item) continue;
+
+    const motion = byTag(comp, 'Motion')[0];
+    const rels = byTag(comp, 'ComponentRelationship');
+    const rel = t => rels.find(r => r.getAttribute('type') === t)?.getAttribute('idRef') || null;
+    let vec = vec3(motion && kids(motion, 'Axis')[0]?.textContent), vecSource = 'probe vector';
+    if (!vec || !vec.some(v => v)) {
+      const L = name?.[0]?.toUpperCase();
+      vec = (L && (kind === 'linear' ? 'XYZUVW' : 'ABC').includes(L)) ? NAME_VEC[L] : null;
+      vecSource = vec ? 'axis letter' : 'auto';
+    }
+    const csRef = item.getAttribute('coordinateSystemIdRef') || motion?.getAttribute('coordinateSystemIdRef') || null;
+    const csMove = motion?.getAttribute('coordinateSystemIdRef') || csRef;
+    const spec = t => byTag(comp, 'Specification').find(s => s.getAttribute('type') === t);
+    const sv = (s, tag) => s ? num(kids(s, tag)[0]?.textContent) : null;
+    const cons = kids(item, 'Constraints')[0];
+    const cMin = sv(cons, 'Minimum'), cMax = sv(cons, 'Maximum');
+    const sLen = spec('LENGTH'), sAng = spec('ANGLE');
+
+    axes.push({
+      id: comp.getAttribute('id'), name, kind, role, vec, vecSource,
+      itemId: item.getAttribute('id'),
+      itemType: item.getAttribute('type') + (item.getAttribute('subType') ? '/' + item.getAttribute('subType') : ''),
+      units: item.getAttribute('units') || '',
+      csName: csRef || item.getAttribute('coordinateSystem') || '', csType: csTypeOf(item),
+      csT: csMove ? csOffset(cs, csMove) : [0,0,0],
+      motionId: motion?.getAttribute('id') || null, motionParent: motion?.getAttribute('parentIdRef') || null,
+      motionType: motion?.getAttribute('type') || '',
+      relParent: rel('PARENT'), relChild: rel('CHILD'),
+      limits: (cMin !== null && cMax !== null && cMax > cMin) ? { min: cMin, max: cMax } : null,   // on the data item
+      specLen: sv(sLen, 'Nominal') ?? ((sv(sLen, 'Maximum') !== null && sv(sLen, 'Minimum') !== null) ? sv(sLen, 'Maximum') - sv(sLen, 'Minimum') : null),
+      specAng: (sv(sAng, 'Minimum') !== null && sv(sAng, 'Maximum') !== null) ? { min: sv(sAng, 'Minimum'), max: sv(sAng, 'Maximum') } : null,
+      samples: [], obsMin: Infinity, obsMax: -Infinity, cur: null, raw: undefined, spin: 0,
+    });
+  }
+
+  // Axes with no usable direction get the first unused one, so unknown names still work
+  for (const kind of ['linear', 'rotary']) {
+    const group = axes.filter(a => a.kind === kind);
+    const used = new Set(group.filter(a => a.vec).map(a => a.vec.map(Math.abs).indexOf(Math.max(...a.vec.map(Math.abs)))));
+    for (const a of group.filter(a => !a.vec)) {
+      if (a.role === 'spindle') { a.vec = [0,0,1]; continue; }
+      const i = [0,1,2].find(i => !used.has(i)) ?? 0; used.add(i);
+      a.vec = [0,0,0]; a.vec[i] = 1;
+    }
+  }
+  for (const a of axes) {
+    const len = Math.hypot(...a.vec);
+    a.k = a.vec.map(Math.abs).indexOf(Math.max(...a.vec.map(Math.abs)));   // dominant machine axis 0/1/2
+    a.gain = a.kind === 'linear' ? len : 1;       // e.g. 0.5 for a lathe X axis that reports diameter
+    a.u = a.vec.map(v => v / len);                // signed unit vector, machine coordinates
+    a.offset = a.kind === 'linear' ? a.csT[a.k] : 0;   // where this coordinate system sits relative to the base
+    a.letter = 'XYZ'[a.k];
+  }
+
+  // Kinematic parents: Motion parentIdRef, else ComponentRelationship PARENT (-> another axis's CHILD id or id)
+  const byMotion = {}, byChild = {}, byId = {};
+  for (const a of axes) { if (a.motionId) byMotion[a.motionId] = a; if (a.relChild) byChild[a.relChild] = a; byId[a.id] = a; }
+  for (const a of axes) {
+    a.parentAxis = (a.motionParent && byMotion[a.motionParent]) || (a.relParent && (byChild[a.relParent] || byId[a.relParent])) || null;
+    if (a.parentAxis === a) a.parentAxis = null;
+    a.kinDeclared = !!(a.motionParent || a.relParent || a.motionId);
+  }
+  return axes;
+}
+
+/* Which axes carry the TOOL and which carry the WORKPIECE?
+   Axes linked by their declared parents form chains. The chain with the most linear axes is the
+   tool side (ties: has a Z-type axis, then has a spindle); the other chains hold the work.
+   If the probe declares no parents at all, fall back to the classic vertical mill: X/Y and
+   rotaries under the table, Z and the spindle on the head. */
+function assignSides(axes) {
+  const root = a => { let r = a, n = 0; while (r.parentAxis && n++ < 20) r = r.parentAxis; return r; };
+  const depth = a => { let d = 0, p = a.parentAxis; while (p && d < 20) { d++; p = p.parentAxis; } return d; };
+  axes.forEach(a => a.depth = depth(a));
+  const kinematic = axes.some(a => a.parentAxis);
+  const trees = new Map();
+  if (kinematic) {
+    for (const a of axes.filter(a => a.kinDeclared)) { const r = root(a); if (!trees.has(r)) trees.set(r, []); trees.get(r).push(a); }
+    const score = l => [l.filter(a => a.role === 'linear').length, l.some(a => a.role === 'linear' && a.k === 2) ? 1 : 0, l.some(a => a.role === 'spindle') ? 1 : 0];
+    let toolTree = null, best = null;
+    for (const l of trees.values()) {
+      const s = score(l);
+      if (!best || s[0] > best[0] || (s[0] === best[0] && (s[1] > best[1] || (s[1] === best[1] && s[2] > best[2])))) { best = s; toolTree = l; }
+    }
+    for (const a of axes) {
+      if (a.kinDeclared) a.side = toolTree.includes(a) ? 'tool' : 'part';
+      else if (a.role === 'spindle') a.side = toolTree.some(b => b.role === 'spindle') ? 'part' : 'tool';
+      else a.side = (a.role === 'linear' && a.k === 2) ? 'tool' : 'part';
+    }
+  } else {
+    for (const a of axes) a.side = (a.role === 'spindle' || (a.role === 'linear' && a.k === 2)) ? 'tool' : 'part';
+  }
+  // A machine whose WORK is held in a spindle is a turning machine (lathe / mill-turn)
+  const turning = axes.some(a => a.side === 'part' && a.role === 'spindle');
+  const ord = a => (a.role === 'linear' ? 0 : a.role === 'rotary' ? 1 : 2);
+  const sortChain = l => l.slice().sort((p, q) => ord(p) - ord(q) || p.depth - q.depth || (p.role === 'linear' ? [1,0,2][p.k] - [1,0,2][q.k] : (p.k === 2) - (q.k === 2)));
+  const tool = sortChain(axes.filter(a => a.side === 'tool'));
+  // Part side: one group per kinematic tree (e.g. main spindle / sub-spindle on its own slide)
+  let partGroups = [];
+  const partAxes = axes.filter(a => a.side === 'part');
+  if (kinematic) {
+    const m = new Map();
+    for (const a of partAxes) { const r = a.kinDeclared ? root(a) : null; if (!m.has(r)) m.set(r, []); m.get(r).push(a); }
+    partGroups = [...m.values()].map(sortChain);
+  } else if (partAxes.length) partGroups = [sortChain(partAxes)];
+  return { mode: kinematic ? 'probe kinematics' : 'layout convention', turning, tool, partGroups };
+}
+
+/* =====================================================================
+   4. SCENE
+   ===================================================================== */
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xd9dee4);
+scene.fog = new THREE.Fog(0xd9dee4, 9000, 22000);
+const camera = new THREE.PerspectiveCamera(38, innerWidth / innerHeight, 10, 40000);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.05;
+$('view').appendChild(renderer.domElement);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true; controls.dampingFactor = 0.08; controls.maxPolarAngle = Math.PI * 0.495;
+scene.add(new THREE.HemisphereLight(0xffffff, 0x8894a3, 1.15));
+const sun = new THREE.DirectionalLight(0xffffff, 2.2);
+sun.castShadow = true; sun.shadow.mapSize.set(2048, 2048); sun.shadow.bias = -0.0004; sun.shadow.normalBias = 2;
+scene.add(sun, sun.target);
+const fill = new THREE.DirectionalLight(0xdfe8ff, 0.6); fill.position.set(-2000, 1500, -1500); scene.add(fill);
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(40000, 40000), new THREE.MeshStandardMaterial({ color: 0xcfd5dc, roughness: 0.95 }));
+floor.rotation.x = -Math.PI / 2; floor.receiveShadow = true; scene.add(floor);
+const grid = new THREE.GridHelper(12000, 60, 0xaab3bf, 0xbcc4ce); grid.position.y = 0.5; scene.add(grid);
+
+const mk = (color, metalness, roughness) => new THREE.MeshStandardMaterial({ color, metalness, roughness });
+const M = {
+  cast: mk(0x56616f, 0.25, 0.7),      // frame castings
+  castDark: mk(0x3c4550, 0.25, 0.75),
+  slide: mk(0xdfe3e8, 0.15, 0.55),    // moving carriages / tables
+  steel: mk(0xaeb7c2, 0.85, 0.3),     // rails, screws, chucks
+  dark: mk(0x23282f, 0.4, 0.6),       // motors, slots
+  tool: mk(0xe9c46a, 0.7, 0.35),
+  stock: mk(0xc9ced6, 0.9, 0.25),
+  rot: mk(0x8e7cc3, 0.25, 0.55),      // rotary-axis bodies
+};
+const AXIS_HEX = [0xd64545, 0x2e9e4f, 0x2f6fd6];            // machine X / Y / Z
+const accent = k => mk(AXIS_HEX[k], 0.2, 0.5);
+const edgeMat = new THREE.LineBasicMaterial({ color: 0x1d232b, transparent: true, opacity: 0.28 });
+
+function solid(geo, mat, edges = true) {
+  const m = new THREE.Mesh(geo, mat); m.castShadow = true; m.receiveShadow = true;
+  if (edges) m.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo, 30), edgeMat));
+  return m;
+}
+const box = (x, y, z, mat) => solid(new THREE.BoxGeometry(x, y, z), mat);
+// Cylinder whose axis lies along scene axis idx (0 x, 1 y, 2 z)
+function cyl(idx, rTop, rBot, len, mat, seg = 36) {
+  const m = solid(new THREE.CylinderGeometry(rTop, rBot, len, seg), mat);
+  if (idx === 0) m.rotation.z = -Math.PI / 2; else if (idx === 2) m.rotation.x = Math.PI / 2;
+  return m;
+}
+// Box given by its size along axis idx and along the two other axes (in x,y,z order)
+function boxAlong(idx, along, o1, o2, mat) { const d = [0,0,0]; d[idx] = along; const o = [0,1,2].filter(i => i !== idx); d[o[0]] = o1; d[o[1]] = o2; return box(d[0], d[1], d[2], mat); }
+const unit = i => new V3(i === 0 ? 1 : 0, i === 1 ? 1 : 0, i === 2 ? 1 : 0);
+const dom = v => { const a = [Math.abs(v.x), Math.abs(v.y), Math.abs(v.z)]; return a.indexOf(Math.max(...a)); };
+function label(text, hex) {
+  const c = document.createElement('canvas'); c.width = 160; c.height = 80; const g = c.getContext('2d');
+  g.fillStyle = '#' + hex.toString(16).padStart(6, '0'); g.beginPath(); g.roundRect(4, 4, 152, 72, 16); g.fill();
+  g.fillStyle = '#fff'; g.font = 'bold 46px system-ui, sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(text, 80, 43);
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c), depthTest: false, transparent: true }));
+  s.scale.set(110, 55, 1); s.renderOrder = 10; return s;
+}
+function meshesOf(root) { const out = []; root.traverse(o => { if (o.isMesh) out.push(o); }); return out; }
+function boxOf(objs, filter) {
+  const b = new THREE.Box3(), t = new THREE.Box3();
+  for (const root of [].concat(objs)) root.traverse(o => { if (o.isMesh && (!filter || filter(o))) { o.geometry.boundingBox || o.geometry.computeBoundingBox(); t.copy(o.geometry.boundingBox).applyMatrix4(o.matrixWorld); b.union(t); } });
+  return b;
+}
+
+/* =====================================================================
+   5. KINEMATICS: values -> joint displacement -> transform
+   ===================================================================== */
+const MM = { MILLIMETER: 1, INCH: 25.4, METER: 1000, CENTIMETER: 10, FOOT: 304.8 };
+// Raw observation -> joint value q.  Linear: true mm of travel from the base origin, using the probe's
+// units, the axis vector length (diameter axes report 2x) and the coordinate system translation.
+// Rotary: degrees.  Spindle: rev/min.
+function toQ(a, v) {
+  if (a.kind === 'linear') return a.gain * (v * (MM[a.units] || 1) - a.offset);
+  if (a.role === 'rotary') return a.units === 'RADIAN' ? THREE.MathUtils.radToDeg(v) : v;
+  return v;
+}
+function applyJoint(a, q) {
+  if (!a.node) return;
+  if (a.kind === 'linear') a.node.position.copy(a.localDir).multiplyScalar(q);
+  else a.node.quaternion.setFromAxisAngle(a.localAxis, THREE.MathUtils.degToRad(q));
+}
+// Travel envelope of each joint: probe limits/specifications first, widened by what the agent has reported
+function computeEnv(a) {
+  const has = isFinite(a.obsMin);
+  if (a.role === 'spindle' || a.motionType === 'CONTINUOUS') return a.env = { lo: 0, hi: 360, full: true, src: 'continuous' };
+  if (a.kind === 'linear') {
+    if (a.limits) { const l = toQ(a, a.limits.min), h = toQ(a, a.limits.max); return a.env = { lo: Math.min(l, h, has ? a.obsMin : l), hi: Math.max(l, h, has ? a.obsMax : h), src: 'probe constraints' }; }
+    const lo = has ? a.obsMin : 0, hi = has ? a.obsMax : 0;
+    const L = Math.max((hi - lo) * 1.08 + 30, a.specLen || 0, 220), c = (lo + hi) / 2;
+    return a.env = { lo: c - L / 2, hi: c + L / 2, src: a.specLen && L === a.specLen ? 'probe specification' : 'observed travel' };
+  }
+  let lo, hi, src;
+  if (a.specAng || a.limits) { const s = a.specAng || a.limits; lo = Math.min(s.min, has ? a.obsMin - 3 : s.min); hi = Math.max(s.max, has ? a.obsMax + 3 : s.max); src = 'probe specification'; }
+  else if (has) { lo = a.obsMin - 10; hi = a.obsMax + 10; src = 'observed travel'; }
+  else { lo = -180; hi = 180; src = 'default'; }
+  if (hi - lo >= 330) return a.env = { lo: 0, hi: 360, full: true, src };
+  return a.env = { lo, hi, src };
+}
+const clampEnv = (a, v) => a.env.full ? v : Math.min(a.env.hi, Math.max(a.env.lo, v));
+function sweepValues(a, fine) {
+  if (a.role === 'spindle') return [0];
+  if (a.kind === 'linear') return [a.env.lo, a.env.hi];
+  const lo = a.env.full ? 0 : a.env.lo, hi = a.env.full ? 360 - (fine ? 30 : 120) : a.env.hi;
+  const n = Math.max(2, Math.ceil((hi - lo) / (fine ? 30 : 60)) + 1);
+  return Array.from({ length: n }, (_, i) => lo + (hi - lo) * i / (n - 1));
+}
+// Visit every combination of joint extremes (linear ends x rotary angle steps)
+function forEachPose(joints, fine, fn) {
+  const lists = joints.map(a => sweepValues(a, fine));
+  const idx = lists.map(() => 0);
+  for (;;) {
+    joints.forEach((a, i) => applyJoint(a, lists[i][idx[i]]));
+    fn();
+    let i = 0;
+    while (i < idx.length && ++idx[i] >= lists[i].length) { idx[i] = 0; i++; }
+    if (i >= idx.length) break;
+  }
+}
+function setMidPose(joints) { joints.forEach(a => applyJoint(a, a.kind === 'linear' ? (a.env.lo + a.env.hi) / 2 : a.role === 'rotary' ? clampEnv(a, 0) : 0)); }
+function sweptBox(root, joints, filter) {
+  const b = new THREE.Box3();
+  forEachPose(joints, true, () => { root.updateMatrixWorld(true); b.union(boxOf(root, filter)); });
+  return b;
+}
+// Furthest any solid under `pivot` gets from the rotation axis (through the pivot, along world dir n)
+function swingRadius(pivot, n) {
+  pivot.updateMatrixWorld(true);
+  const p = new V3().setFromMatrixPosition(pivot.matrixWorld), b = boxOf(pivot), c = new V3(); let r = 0;
+  if (b.isEmpty()) return 0;
+  for (const x of [b.min.x, b.max.x]) for (const y of [b.min.y, b.max.y]) for (const z of [b.min.z, b.max.z]) {
+    c.set(x, y, z).sub(p); c.addScaledVector(n, -c.dot(n)); r = Math.max(r, c.length());
+  }
+  return r;
+}
+// Oriented-box overlap test (corner / centre sampling, both directions)
+const _inv = new THREE.Matrix4(), _p = new V3(), _bb = new THREE.Box3();
+function obbTouch(m1, m2) {
+  const g1 = m1.geometry, g2 = m2.geometry;
+  g1.boundingBox || g1.computeBoundingBox(); g2.boundingBox || g2.computeBoundingBox();
+  _bb.copy(g2.boundingBox).expandByScalar(-1.5); _inv.copy(m2.matrixWorld).invert();
+  const b = g1.boundingBox;
+  for (let i = 0; i < 27; i++) {
+    _p.set([b.min.x, (b.min.x + b.max.x) / 2, b.max.x][i % 3], [b.min.y, (b.min.y + b.max.y) / 2, b.max.y][Math.floor(i / 3) % 3], [b.min.z, (b.min.z + b.max.z) / 2, b.max.z][Math.floor(i / 9)]);
+    _p.applyMatrix4(m1.matrixWorld).applyMatrix4(_inv);
+    if (_bb.containsPoint(_p)) return true;
+  }
+  return false;
+}
+const _wa = [], _wb = [];
+function anyContactFast(A, B) {
+  for (let i = 0; i < A.length; i++) { const g = A[i].geometry; g.boundingBox || g.computeBoundingBox(); (_wa[i] ||= new THREE.Box3()).copy(g.boundingBox).applyMatrix4(A[i].matrixWorld); }
+  for (let j = 0; j < B.length; j++) { const g = B[j].geometry; g.boundingBox || g.computeBoundingBox(); (_wb[j] ||= new THREE.Box3()).copy(g.boundingBox).applyMatrix4(B[j].matrixWorld); }
+  for (let i = 0; i < A.length; i++) for (let j = 0; j < B.length; j++) if (_wa[i].intersectsBox(_wb[j]) && (obbTouch(A[i], B[j]) || obbTouch(B[j], A[i]))) return true;
+  return false;
+}
+// Dense sweep: horizontal travel in 5 steps (closer together than the head is wide), vertical at both ends, rotaries every 30-45 deg
+function denseValues(a) {
+  if (a.role === 'spindle') return [0];
+  if (a.kind === 'linear') { const n = Math.abs(a.S.y) > 0.5 ? 2 : 5; return Array.from({ length: n }, (_, i) => a.env.lo + (a.env.hi - a.env.lo) * i / (n - 1)); }
+  if (a.env.full) return [0, 45, 90, 135, 180, 225, 270, 315];
+  const n = Math.max(2, Math.ceil((a.env.hi - a.env.lo) / 30) + 1); return Array.from({ length: n }, (_, i) => a.env.lo + (a.env.hi - a.env.lo) * i / (n - 1));
+}
+function denseContact(joints, A, B, root) {
+  const lists = joints.map(denseValues), idx = lists.map(() => 0);
+  for (;;) {
+    joints.forEach((a, i) => applyJoint(a, lists[i][idx[i]])); root.updateMatrixWorld(true);
+    if (anyContactFast(A, B)) return true;
+    let i = 0; while (i < idx.length && ++idx[i] >= lists[i].length) { idx[i] = 0; i++; }
+    if (i >= idx.length) return false;
+  }
+}
+function anyContact(A, B) { for (const a of A) for (const b of B) if (obbTouch(a, b) || obbTouch(b, a)) return [a, b]; return null; }
+
+
+/* =====================================================================
+   5b. PARTS KIT
+   The shapes of the machine parts were modelled in Trimble SketchUp (cnc_twin_parts_kit.skp) and read
+   back from that model (kit.json, embedded below). Each part is rebuilt here as a mesh and resized to the
+   length each axis needs WITHOUT distorting it: the two halves are moved apart, so chamfers, rails,
+   bearing blocks and flanges keep their modelled size.
+   ===================================================================== */
+const KIT = {"block":[{"m":"cast","t":"box","b":[0,0,0,400,300,200],"c":10}],"blockL":[{"m":"castd","t":"box","b":[0,0,0,600,500,300],"c":28}],"carriage":[{"m":"slide","t":"box","b":[0,0,30,280,380,80],"c":7},{"m":"slide","t":"box","b":[25,40,80,255,340,86],"c":2},{"m":"steel","t":"box","b":[12,40,0,102,100,30],"c":4},{"m":"steel","t":"box","b":[12,280,0,102,340,30],"c":4},{"m":"steel","t":"box","b":[178,40,0,268,100,30],"c":4},{"m":"steel","t":"box","b":[178,280,0,268,340,30],"c":4},{"m":"dark","t":"box","b":[100,155,0,180,225,30],"c":4},{"m":"accent","t":"box","b":[20,-2,46,260,382,62],"c":2}],"railplate":[{"m":"cast","t":"box","b":[0,0,0,320,50,600],"c":6},{"m":"steel","t":"box","b":[31,50,20,59,72,580],"c":3},{"m":"steel","t":"box","b":[261,50,20,289,72,580],"c":3},{"m":"steel","t":"loft","o":[160,62],"p":[[30,10],[570,10]],"n":12},{"m":"dark","t":"box","b":[122,50,20,198,72,70],"c":3},{"m":"dark","t":"box","b":[122,50,530,198,72,580],"c":3}],"motor":[{"m":"dark","t":"box","b":[-50,-50,0,50,50,12],"c":3},{"m":"dark","t":"loft","o":[0,0],"p":[[12,42],[98,42],[102,38],[120,38]],"n":20},{"m":"steel","t":"box","b":[-17,30,50,17,50,80],"c":3}],"ram":[{"m":"slide","t":"box","b":[0,8,8,576,202,202],"c":14},{"m":"steel","t":"box","b":[576,0,0,600,210,210],"c":6}],"head":[{"m":"cast","t":"box","b":[12,0,0,258,226,240],"c":16},{"m":"slide","t":"box","b":[40,226,30,230,246,210],"c":5},{"m":"castd","t":"box","b":[0,20,20,12,200,220],"c":3},{"m":"castd","t":"box","b":[258,20,20,270,200,220],"c":3},{"m":"dark","t":"loft","o":[135,125],"p":[[240,84],[280,84],[286,70],[300,70]],"n":20},{"m":"accent","t":"box","b":[75,246,195,195,260,225],"c":3}],"spindle":[{"m":"dark","t":"loft","o":[0,0],"p":[[0,20],[6,27],[34,27],[36,33],[60,44]],"n":20},{"m":"steel","t":"loft","o":[0,0],"p":[[60,62],[68,66],[116,78],[132,78]],"n":28}],"endmill":[{"m":"tool","t":"loft","o":[0,0],"p":[[0,4],[5,13],[70,13],[72,10],[105,10]],"n":14}],"table":[{"m":"rot","t":"loft","o":[0,0],"p":[[0,215],[8,215],[11,205],[26,205]],"n":36},{"m":"steel","t":"loft","o":[0,0],"p":[[26,195],[56,195],[60,190]],"n":36}],"chuck":[{"m":"steel","t":"loft","o":[0,0],"p":[[0,118],[8,135],[82,135],[95,126]],"n":36},{"m":"dark","t":"box","b":[48,-20,95,126,20,111],"c":3},{"m":"dark","t":"box","b":[48,-20,111,96,20,125],"c":3},{"m":"dark","rz":120,"t":"box","b":[48,-20,95,126,20,111],"c":3},{"m":"dark","rz":120,"t":"box","b":[48,-20,111,96,20,125],"c":3},{"m":"dark","rz":-120,"t":"box","b":[48,-20,95,126,20,111],"c":3},{"m":"dark","rz":-120,"t":"box","b":[48,-20,111,96,20,125],"c":3}],"cheek":[{"m":"rot","t":"poly","p":[[300,150],[300,60],[240,0],[60,0],[0,60],[0,150]],"z":[0,30]}],"support":[{"m":"cast","t":"poly","p":[[0,110],[45,400],[185,400],[230,110],[230,0],[0,0]],"z":[0,80]}],"housing":[{"m":"steel","t":"loft","o":[0,0],"p":[[0,60],[30,62]],"n":24},{"m":"steel","t":"loft","o":[0,0],"p":[[30,62],[36,62]],"n":24},{"m":"rot","t":"loft","o":[0,0],"p":[[36,86],[42,95],[220,95],[226,86]],"n":32},{"m":"steel","t":"loft","o":[0,0],"p":[[226,62],[232,62]],"n":24},{"m":"steel","t":"loft","o":[0,0],"p":[[232,62],[262,60]],"n":24},{"m":"rot","t":"box","b":[-75,-95,56,75,0,206],"c":8}],"vise":[{"m":"dark","t":"box","b":[0,0,0,190,190,26],"c":4},{"m":"steel","t":"box","b":[0,0,26,190,30,76],"c":4},{"m":"steel","t":"box","b":[0,160,26,190,190,76],"c":4}],"headstock":[{"m":"cast","t":"poly","p":[[0,430],[50,490],[330,490],[380,430],[380,0],[0,0]],"z":[0,380]}],"drum":[{"m":"dark","t":"loft","o":[0,0],"p":[[0,95],[10,105],[118,105],[132,88],[150,88]],"n":28}]};
+// how each part's SketchUp axes map to its (a, b, c) = (length / axis, width, thickness) frame
+const KIT_AX = { block: [0,1,2], blockL: [0,1,2], carriage: [0,1,2], railplate: [2,0,1], motor: [2,0,1], ram: [0,1,2], head: [0,2,1],
+  spindle: [2,0,1], endmill: [2,0,1], table: [2,0,1], chuck: [2,0,1], cheek: [2,1,0], support: [2,1,0], housing: [2,1,0], vise: [0,2,1], headstock: [0,1,2], drum: [2,0,1] };
+const KIT_ROUND = new Set(['motor', 'spindle', 'endmill', 'table', 'chuck', 'housing', 'drum']);
+const kitCache = {};
+function kitPart(name) {
+  if (kitCache[name]) return kitCache[name];
+  const out = {};                                    // material key -> { pos: [], nor: [] } in SketchUp coordinates
+  const put = (m, p, n) => { const o = (out[m] ||= { pos: [], nor: [] }); o.pos.push(...p); o.nor.push(...n); };
+  const sub = (a, b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]], cross = (a, b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+  const dot = (a, b) => a[0]*b[0]+a[1]*b[1]+a[2]*b[2], norm = a => { const l = Math.hypot(...a) || 1; return a.map(v => v / l); };
+  const rotZ = (p, d) => { if (!d) return p; const r = d * Math.PI / 180, c = Math.cos(r), s = Math.sin(r); return [c*p[0]-s*p[1], s*p[0]+c*p[1], p[2]]; };
+  const convex = (m, pts, outward, rz) => {          // planar convex polygon -> triangle fan
+    const cen = pts[0].map((_, k) => pts.reduce((t, p) => t + p[k], 0) / pts.length);
+    let n = [0,0,0];
+    for (let i = 0; i < pts.length && !(Math.hypot(...n) > 1e-6); i++) n = cross(sub(pts[i], cen), sub(pts[(i + 1) % pts.length], cen));
+    const u = norm(sub(pts[0], cen)); n = norm(n); if (dot(n, outward) < 0) n = n.map(v => -v);
+    const v = cross(n, u), ang = p => Math.atan2(dot(sub(p, cen), v), dot(sub(p, cen), u));
+    const s = pts.slice().sort((a, b) => ang(a) - ang(b)), nn = rotZ(n, rz);
+    for (let i = 1; i + 1 < s.length; i++) for (const p of [s[0], s[i], s[i + 1]]) put(m, rotZ(p, rz), nn);
+  };
+  for (const L of KIT[name]) {
+    if (L.t === 'box') {
+      const lo = L.b.slice(0, 3), hi = L.b.slice(3), c = L.c, ctr = lo.map((v, k) => (v + hi[k]) / 2);
+      const P = (cs, ax) => [0,1,2].map(k => k === ax ? (cs[k] ? hi[k] : lo[k]) : (cs[k] ? hi[k] - c : lo[k] + c));
+      const face = pts => convex(L.m, pts, sub(pts[0].map((_, k) => pts.reduce((t, p) => t + p[k], 0) / pts.length), ctr), L.rz);
+      for (let ax = 0; ax < 3; ax++) {
+        const o = [0,1,2].filter(k => k !== ax);
+        for (const s of [0, 1]) { const pts = []; for (const p of [0, 1]) for (const q of [0, 1]) { const cs = [0,0,0]; cs[ax] = s; cs[o[0]] = p; cs[o[1]] = q; pts.push(P(cs, ax)); } face(pts); }
+        for (const p of [0, 1]) for (const q of [0, 1]) { const pts = []; for (const s of [0, 1]) { const cs = [0,0,0]; cs[ax] = s; cs[o[0]] = p; cs[o[1]] = q; pts.push(P(cs, o[0]), P(cs, o[1])); } face(pts); }
+      }
+      for (const a of [0, 1]) for (const b of [0, 1]) for (const d of [0, 1]) face([P([a, b, d], 0), P([a, b, d], 1), P([a, b, d], 2)]);
+    } else if (L.t === 'loft') {
+      const n = L.n, [ox, oy] = L.o, pr = L.p, pt = (z, r, j) => { const t = 2 * Math.PI * j / n; return [ox + r * Math.cos(t), oy + r * Math.sin(t), z]; };
+      for (let i = 0; i + 1 < pr.length; i++) {
+        const [z0, r0] = pr[i], [z1, r1] = pr[i + 1], l = Math.hypot(z1 - z0, r1 - r0) || 1, nr = (z1 - z0) / l, nz = -(r1 - r0) / l;
+        for (let j = 0; j < n; j++) {
+          const N = k => { const t = 2 * Math.PI * k / n; return [Math.cos(t) * nr, Math.sin(t) * nr, nz]; };
+          const A = pt(z0, r0, j), B = pt(z0, r0, j + 1), C = pt(z1, r1, j + 1), D = pt(z1, r1, j);
+          put(L.m, A, N(j)); put(L.m, B, N(j + 1)); put(L.m, C, N(j + 1)); put(L.m, A, N(j)); put(L.m, C, N(j + 1)); put(L.m, D, N(j));
+        }
+      }
+      for (const [e, nz] of [[pr[0], -1], [pr[pr.length - 1], 1]]) if (e[1] > 0) for (let j = 0; j < n; j++) for (const p of [[ox, oy, e[0]], pt(e[0], e[1], j), pt(e[0], e[1], j + 1)]) put(L.m, p, [0, 0, nz]);
+    } else if (L.t === 'poly') {
+      const p2 = L.p, [z0, z1] = L.z, cx = p2.reduce((t, p) => t + p[0], 0) / p2.length, cy = p2.reduce((t, p) => t + p[1], 0) / p2.length;
+      convex(L.m, p2.map(p => [p[0], p[1], z0]), [0, 0, -1]); convex(L.m, p2.map(p => [p[0], p[1], z1]), [0, 0, 1]);
+      p2.forEach((p, i) => { const q = p2[(i + 1) % p2.length]; convex(L.m, [[p[0], p[1], z0], [q[0], q[1], z0], [q[0], q[1], z1], [p[0], p[1], z1]], [(p[0] + q[0]) / 2 - cx, (p[1] + q[1]) / 2 - cy, 0]); });
+    }
+  }
+  // SketchUp axes -> (a, b, c), centred (turned parts keep their axis on the origin)
+  const ax = KIT_AX[name], round = KIT_ROUND.has(name), lo = [1e9, 1e9, 1e9], hi = [-1e9, -1e9, -1e9];
+  for (const o of Object.values(out)) { for (const arr of [o.pos, o.nor]) for (let i = 0; i < arr.length; i += 3) { const t = [arr[i + ax[0]], arr[i + ax[1]], arr[i + ax[2]]]; arr[i] = t[0]; arr[i + 1] = t[1]; arr[i + 2] = t[2]; }
+    for (let i = 0; i < o.pos.length; i++) { lo[i % 3] = Math.min(lo[i % 3], o.pos[i]); hi[i % 3] = Math.max(hi[i % 3], o.pos[i]); } }
+  const cen = lo.map((v, k) => (round && k > 0) ? 0 : (v + hi[k]) / 2), size = lo.map((v, k) => (round && k > 0) ? 2 * Math.max(-v, hi[k]) : hi[k] - v);
+  for (const o of Object.values(out)) for (let i = 0; i < o.pos.length; i++) o.pos[i] -= cen[i % 3];
+  return kitCache[name] = { tris: out, size, round };
+}
+// A kit part resized to dims = [a, b, c] mm, with its a/b/c axes laid along scene axes `axes` (flips mirror it)
+function K(name, dims, axes, opt = {}) {
+  const P = kitPart(name), flips = opt.flips || [1, 1, 1], keys = Object.keys(P.tris);
+  const total = keys.reduce((t, k) => t + P.tris[k].pos.length, 0), pos = new Float32Array(total), nor = new Float32Array(total);
+  const sc = dims.map((T, i) => T / P.size[i]), grow = dims.map((T, i) => (T - P.size[i]) / 2), geo = new THREE.BufferGeometry(), mats = [];
+  let w = 0;
+  for (const key of keys) {
+    const o = P.tris[key], start = w / 3;
+    for (let i = 0; i < o.pos.length; i += 3) {
+      for (let k = 0; k < 3; k++) {
+        let v = o.pos[i + k];
+        if (P.round ? true : grow[k] < 0) v *= sc[k]; else v += Math.sign(v) * grow[k];
+        pos[w + axes[k]] = flips[k] * v; nor[w + axes[k]] = flips[k] * o.nor[i + k];
+      }
+      w += 3;
+    }
+    for (let t = start * 3; t < w; t += 9) {           // keep triangles facing the way their normals point
+      const e1 = [pos[t+3]-pos[t], pos[t+4]-pos[t+1], pos[t+5]-pos[t+2]], e2 = [pos[t+6]-pos[t], pos[t+7]-pos[t+1], pos[t+8]-pos[t+2]];
+      const cx = e1[1]*e2[2]-e1[2]*e2[1], cy = e1[2]*e2[0]-e1[0]*e2[2], cz = e1[0]*e2[1]-e1[1]*e2[0];
+      if (cx * (nor[t]+nor[t+3]+nor[t+6]) + cy * (nor[t+1]+nor[t+4]+nor[t+7]) + cz * (nor[t+2]+nor[t+5]+nor[t+8]) < 0)
+        for (const arr of [pos, nor]) for (let k = 0; k < 3; k++) { const tmp = arr[t+3+k]; arr[t+3+k] = arr[t+6+k]; arr[t+6+k] = tmp; }
+    }
+    geo.addGroup(start, w / 3 - start, mats.length);
+    mats.push(key === 'accent' ? (opt.accent ?? M.cast) : (opt.mat || { cast: M.cast, castd: M.castDark, slide: M.slide, steel: M.steel, dark: M.dark, tool: M.tool, rot: M.rot }[key]));
+  }
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3)); geo.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+  geo.computeBoundingBox(); geo.computeBoundingSphere();
+  const m = new THREE.Mesh(geo, mats); m.castShadow = true; m.receiveShadow = true;
+  m.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo, 28), edgeMat));
+  return m;
+}
+// Kit block laid out like box(x, y, z)
+const KB = (x, y, z, mat, name = 'block') => K(name, [x, y, z], [0, 1, 2], { mat });
+
+/* =====================================================================
+   6. BUILDING THE MACHINE, PART BY PART
+   All dimensions are millimetres. Scene Y is up.
+   ===================================================================== */
+const CAR = 280, PLATE = 50, RAIL = 22, CLR = 18;
+
+// Guideway fixed to the parent + carriage that travels on it.  `n` = scene axis index the stack grows along.
+function addSlide(parent, mount, a, n, fixedOut) {
+  const D = a.S, i = dom(D), o = [0,1,2].find(j => j !== i && j !== n);
+  const mid = (a.env.lo + a.env.hi) / 2, Lr = (a.env.hi - a.env.lo) + CAR, N = unit(n), O = unit(o);
+  const at = (alongD, alongN, alongO = 0) => mount.clone().addScaledVector(D, alongD).addScaledVector(N, alongN).addScaledVector(O, alongO);
+  const fixed = [], fl = [Math.sign(D.getComponent(i)) || 1, 1, 1];
+  const plate = K('railplate', [Lr + 40, 320, PLATE + RAIL], [i, o, n], { flips: fl }); plate.position.copy(at(mid, (PLATE + RAIL) / 2)); fixed.push(plate);
+  const motor = K('motor', [120, 100, 100], [i, o, n], { flips: fl }); motor.position.copy(at(mid + (Lr / 2 + 80), PLATE + 44)); fixed.push(motor);
+  const g = new THREE.Group(); parent.add(g);
+  const car = K('carriage', [CAR, 380, 86], [i, o, n], { flips: fl, accent: accent(a.k) }); car.position.copy(at(0, PLATE + RAIL + 43)); g.add(car);
+  const tag = label(a.name, AXIS_HEX[a.k]); tag.position.copy(at(0, PLATE + RAIL + 150, 215)); g.add(tag);
+  fixed.forEach(f => { parent.add(f); fixedOut && fixedOut.push(f); });
+  a.node = g; a.localDir = D.clone();
+  return { g, mount: at(0, PLATE + RAIL + 86) };
+}
+// Ram / quill: a fixed housing with a bar that telescopes out of its front (stack axis == travel axis)
+function addRam(parent, mount, a, n, fixedOut) {
+  const D = a.S, s = Math.sign(D.getComponent(n)) || 1, N = unit(n);
+  const qmin = s > 0 ? a.env.lo : -a.env.hi, trav = a.env.hi - a.env.lo, Hs = CAR + trav;
+  const o = [0,1,2].filter(j => j !== n);
+  const housing = K('block', [Hs, 310, 310], [n, o[0], o[1]]); housing.position.copy(mount).addScaledVector(N, Hs / 2); parent.add(housing); fixedOut && fixedOut.push(housing);
+  const g = new THREE.Group(); parent.add(g);
+  const z0 = -qmin, len = Hs + 130;
+  const ram = K('ram', [len, 210, 210], [n, o[0], o[1]]); ram.position.copy(mount).addScaledVector(N, z0 + len / 2); g.add(ram);
+  const strip = boxAlong(n, 46, 204, 204, accent(a.k)); strip.position.copy(mount).addScaledVector(N, z0 + len - 70); g.add(strip);
+  const tag = label(a.name, AXIS_HEX[a.k]); tag.position.copy(mount).addScaledVector(N, z0 + len - 50).addScaledVector(unit(n === 1 ? 2 : 1), 190); g.add(tag);
+  a.node = g; a.localDir = D.clone();
+  return { g, mount: mount.clone().addScaledVector(N, z0 + len) };
+}
+
+/* ---------- TOOL SIDE: frame -> slides (stacked towards the operator) -> head -> rotary head axes -> spindle + tool ---------- */
+function buildTool(chain, toolDir) {
+  const root = new THREE.Group(), fixed = [];
+  let parent = root, mount = new V3(0, 0, 0);
+  const lin = chain.filter(a => a.role === 'linear'), rot = chain.filter(a => a.role === 'rotary'), spn = chain.filter(a => a.role === 'spindle');
+  lin.forEach((a, n) => {
+    const r = dom(a.S) === 2 ? addRam(parent, mount, a, 2, n === 0 ? fixed : null) : addSlide(parent, mount, a, 2, n === 0 ? fixed : null);
+    parent = r.g; mount = r.mount;
+  });
+  // Head frame: built as if the tool points straight down (-Y), then turned so that it points along toolDir
+  const head = new THREE.Group(); head.position.copy(mount);
+  head.quaternion.setFromUnitVectors(new V3(0, -1, 0), toolDir);
+  parent.add(head);
+  const Qi = head.quaternion.clone().invert();
+  const block = K('head', [270, 300, 260], [0, 1, 2], { accent: accent(2) }); block.position.set(0, 0, 130); head.add(block);
+  if (!lin.length) fixed.push(block);
+  let hp = head, hm = new V3(0, -150, 130);
+  const forks = [];
+  for (const a of rot) {
+    const ax = a.S.clone().applyQuaternion(Qi), i = dom(ax);
+    ax.set(0, 0, 0).setComponent(i, Math.sign(a.S.clone().applyQuaternion(Qi).getComponent(i)) || 1);
+    const g = new THREE.Group(); g.position.copy(hm);
+    if (i === 1) {                                   // turns about the tool axis: swivel ring
+      const ring = cyl(1, 125, 125, 56, M.rot); ring.position.y = -28; g.add(ring);
+      const mark = box(30, 20, 60, M.dark); mark.position.set(0, -28, 115); g.add(mark);
+      hp.add(g); hm = new V3(0, -56, 0);
+    } else {                                         // tilts the spindle: fork + swivelling housing
+      const housing = K('housing', [262, 190, 190], [i, 1, i === 0 ? 2 : 0]); g.add(housing);
+      const tag = label(a.name, AXIS_HEX[a.k]); tag.position.copy(unit(i)).multiplyScalar(190); g.add(tag);
+      hp.add(g); forks.push({ a, g, carrier: hp, i, at: hm.clone() }); hm = new V3(0, -95, 0);
+    }
+    a.node = g; a.localAxis = ax; hp = g;
+  }
+  // Spindle cartridge, tool holder and cutter
+  const sp = new THREE.Group(); sp.position.copy(hm); hp.add(sp);
+  const cart = K('spindle', [132, 156, 156], [1, 0, 2]); cart.position.y = -66; sp.add(cart);
+  const cutter = K('endmill', [105, 26, 26], [1, 0, 2]); cutter.position.y = -184.5; sp.add(cutter);
+  const tip = new THREE.Object3D(); tip.position.y = -237; sp.add(tip);
+  for (const a of spn) { a.node = sp; a.localAxis = new V3(0, Math.sign(a.S.clone().applyQuaternion(Qi).y) || 1, 0); }
+  // Hang each tilting head far enough from its carrier that housing + tool clear it at every angle
+  root.updateMatrixWorld(true);
+  for (const f of forks.slice().reverse()) {
+    const n = unit(f.i).applyQuaternion(f.g.getWorldQuaternion(new THREE.Quaternion()));
+    const drop = swingRadius(f.g, n) + 22;
+    f.g.position.copy(f.at).add(new V3(0, -drop, 0));
+    for (const sd of [-1, 1]) { const arm = K('support', [34, drop + 70, 190], [f.i, 1, f.i === 0 ? 2 : 0], { flips: [1, -1, 1] }); arm.position.copy(f.at).add(new V3(0, -(drop + 70) / 2 + 10, 0)).addScaledVector(unit(f.i), sd * 150); f.carrier.add(arm); }
+    root.updateMatrixWorld(true);
+  }
+  return { root, fixed, tip, joints: chain.filter(a => a.node && a.role !== 'spindle'), spindle: sp };
+}
+
+/* ---------- WORK SIDE, milling: pedestal -> slides -> trunnion / rotary table -> fixture + stock ---------- */
+function buildMillWork(chain) {
+  const root = new THREE.Group();
+  let parent = root, mount = new V3(0, 0, 0);
+  const tilts = [];
+  for (const a of chain) {
+    const i = dom(a.S);
+    if (a.role === 'linear') {
+      const r = i === 1 ? addRam(parent, mount, a, 1) : addSlide(parent, mount, a, 1);
+      parent = r.g; mount = r.mount;
+    } else if (i === 1) {                            // rotary table (or a vertical work spindle)
+      const g = new THREE.Group(); g.position.copy(mount); parent.add(g);
+      const tbl = K('table', [60, 430, 430], [1, 0, 2]); tbl.position.y = 30; g.add(tbl);
+      for (const r of [0, 1, 2]) { const slot = box(380, 3, 14, M.dark); slot.rotation.y = r * Math.PI / 3; slot.position.y = 60; g.add(slot); }
+      const mark = box(26, 36, 40, accent(a.k)); mark.position.set(0, 43, 190); g.add(mark);
+      const tag = label(a.name, AXIS_HEX[a.k]); tag.position.set(0, 60, 290); g.add(tag);
+      a.node = g; a.localAxis = a.S.clone(); parent = g; mount = new V3(0, 60, 0);
+    } else {                                         // trunnion: tilting cradle between two supports
+      const o = i === 0 ? 2 : 0, half = 255;
+      const holder = new THREE.Group(); holder.position.copy(mount); parent.add(holder);
+      const basep = K('block', [2 * half + 230, 40, 330], [i, 1, o]); basep.position.y = 20; holder.add(basep);
+      const drum = K('drum', [150, 210, 210], [i, 1, o]); holder.add(drum);
+      const pivot = new THREE.Group(); holder.add(pivot);
+      const cradle = K('block', [2 * half, 54, 420], [i, 1, o], { mat: M.rot }); cradle.position.y = -87; pivot.add(cradle);
+      for (const s of [-1, 1]) {
+        const cheek = K('cheek', [30, 150, 300], [i, 1, o]); cheek.position.copy(unit(i)).multiplyScalar(s * (half - 15)).add(new V3(0, -40, 0)); pivot.add(cheek);
+        const jr = cyl(i, 60, 60, 50, M.steel, 24); jr.position.copy(unit(i)).multiplyScalar(s * (half + 10)); pivot.add(jr);
+      }
+      const tag = label(a.name, AXIS_HEX[a.k]); tag.position.copy(unit(i)).multiplyScalar(half + 215); pivot.add(tag);
+      a.node = pivot; a.localAxis = a.S.clone(); tilts.push({ a, pivot, holder, drum, i, o, half });
+      parent = pivot; mount = new V3(0, -60, 0);
+    }
+  }
+  const fx = new THREE.Group(); fx.position.copy(mount); parent.add(fx);
+  const fixture = K('vise', [190, 76, 190], [0, 1, 2]); fixture.position.y = 38; fx.add(fixture);
+  const stock = box(130, 170, 130, M.stock); stock.position.y = 111; fx.add(stock);   // billet as tall as the table edge swings
+  const ref = new THREE.Object3D(); ref.position.y = 196; fx.add(ref);
+  // Trunnion pivot height = its swing radius, so the cradle and everything on it can turn without touching what carries it
+  root.updateMatrixWorld(true);
+  for (const t of tilts.slice().reverse()) {
+    const r = swingRadius(t.pivot, unit(t.i).applyQuaternion(t.pivot.getWorldQuaternion(new THREE.Quaternion())));
+    const h = 40 + r + 14;
+    t.pivot.position.y = h;
+    for (const sd of [-1, 1]) { const b = K('support', [80, h + 30, 230], [t.i, 1, t.o]); b.position.copy(unit(t.i)).multiplyScalar(sd * (t.half + 60)).setY(40 + (h + 30) / 2); t.holder.add(b); }
+    t.drum.position.copy(unit(t.i)).multiplyScalar(t.half + 175).setY(h);
+    root.updateMatrixWorld(true);
+  }
+  // Pedestal under whatever the first stage needs
+  const fb = boxOf(root, m => m.parent === root || m.parent?.parent === root && !chain.some(a => a.node === m.parent));
+  const f0 = fb.isEmpty() ? new THREE.Box3(new V3(-200, 0, -200), new V3(200, 0, 200)) : fb;
+  const ped = KB(Math.max(f0.max.x - f0.min.x + 60, 420), 300, Math.max(f0.max.z - f0.min.z + 60, 420), null, 'blockL');
+  ped.position.set((f0.min.x + f0.max.x) / 2, -150, (f0.min.z + f0.max.z) / 2); root.add(ped);
+  return { root, ref, trailFrame: fx, joints: chain.filter(a => a.node && a.role !== 'spindle') };
+}
+
+/* ---------- WORK SIDE, turning: (slide ->) headstock -> chuck (+ C axis) -> bar stock ---------- */
+const CL_H = 250, STAGE_H = PLATE + RAIL + 86;
+function buildWorkUnit(chain, face, levels, withStock) {
+  const root = new THREE.Group();
+  const lin = chain.filter(a => a.role === 'linear'), turn = chain.filter(a => a.role !== 'linear');
+  let parent = root, mount = new V3(0, 0, 0);
+  const riser = (levels - lin.length) * STAGE_H;
+  if (riser > 0) { const r = KB(470, riser, 400, M.castDark); r.position.set(-face * 215, riser / 2, 0); root.add(r); mount.y = riser; }
+  for (const a of lin) { const r = dom(a.S) === 1 ? addRam(parent, mount, a, 1) : addSlide(parent, mount, a, 1); parent = r.g; mount = r.mount; }
+  const hs = K('headstock', [380, 2 * CL_H - 10, 380], [0, 1, 2]); hs.position.copy(mount).add(new V3(-face * (95 + 190), (2 * CL_H - 10) / 2, 0)); hs.userData.tall = true; parent.add(hs);
+  let cp = parent; const centre = mount.clone().add(new V3(0, CL_H, 0));
+  let first = true;
+  for (const a of turn) {                            // work spindle and any C axis on the same centre line share the chuck
+    const g = new THREE.Group(); if (first) g.position.copy(centre); first = false;
+    cp.add(g); a.node = g; a.localAxis = new V3(Math.sign(a.S.x) || 1, 0, 0); cp = g;
+  }
+  if (first) { const g = new THREE.Group(); g.position.copy(centre); cp.add(g); cp = g; }
+  const chuck = K('chuck', [125, 270, 270], [0, 1, 2], { flips: [face, 1, 1] }); chuck.position.x = -face * 32.5; chuck.userData.tall = true; cp.add(chuck);
+  const name = turn.map(a => a.name).join(' / ');
+  if (name) { const tag = label(name.length > 5 ? turn[0].name : name, AXIS_HEX[turn[0].k]); tag.position.set(-face * 250, CL_H + 60, 0); cp.parent.add(tag); if (cp.parent !== parent) tag.position.add(new V3()); }
+  let ref = new THREE.Object3D(); cp.add(ref);
+  if (withStock) { const bar = cyl(0, 40, 40, 260, M.stock, 28); bar.position.x = face * 130; cp.add(bar); ref.position.x = face * 200; }
+  return { root, ref, face, joints: chain.filter(a => a.node && a.role !== 'spindle'), lin };
+}
+
+/* ---------- ASSEMBLY + COLLISION-FREE LAYOUT ---------- */
+let machineRoot = null, axes = [], sides = null, twin = null, firstView = true;
+
+function buildMachine() {
+  if (machineRoot) scene.remove(machineRoot);
+  machineRoot = new THREE.Group();
+  const turning = sides.turning;
+  // Machine -> scene.  Milling: machine Z is up.  Turning: machine Z (the work spindle) lies left-right, X is up.
+  const S = turning ? v => new V3(v[2], v[0], v[1]) : v => new V3(v[0], v[2], -v[1]);
+  for (const a of axes) { a.S = S(a.u); a.node = null; computeEnv(a); }
+  const toolDir = S([0, 0, -1]);                     // ISO: at zero the tool points along -Z
+
+  const tool = buildTool(sides.tool, toolDir);
+  machineRoot.add(tool.root);
+  machineRoot.updateMatrixWorld(true);
+  const TB = sweptBox(tool.root, tool.joints);       // everything the tool side can ever occupy
+  setMidPose(tool.joints); machineRoot.updateMatrixWorld(true);
+  const tipMid = tool.tip.getWorldPosition(new V3());
+
+  const work = [];
+  let clr = CLR, tries = 0, layoutOK = false, floorY = 0;
+  const place = () => {
+    work.forEach(w => machineRoot.remove(w.root)); work.length = 0;
+    if (!turning) {
+      const w = buildMillWork(sides.partGroups.flat()); machineRoot.add(w.root); machineRoot.updateMatrixWorld(true);
+      const PB = sweptBox(w.root, w.joints);
+      setMidPose(w.joints); machineRoot.updateMatrixWorld(true);
+      const refMid = w.ref.getWorldPosition(new V3());
+      // Under the tool, with the top of the work envelope just below the lowest point the tool can reach
+      w.root.position.set(tipMid.x - refMid.x, TB.min.y - clr - PB.max.y, tipMid.z - refMid.z);
+      work.push(w);
+    } else {
+      const groups = sides.partGroups.filter(g => g.some(a => a.role !== 'linear'));
+      const levels = Math.max(0, ...groups.map(g => g.filter(a => a.role === 'linear').length));
+      const yc = TB.min.y - clr - 40;                // centre line: bar surface just under the tool envelope
+      const side = { '-1': 0, '1': 0 };
+      groups.forEach((g, n) => {
+        const moving = g.some(a => a.role === 'linear');
+        const toward = Math.sign(toolDir.x) || -1;   // the fixed headstock is on the side the tool points to at zero
+        const face = moving ? toward : -toward;      // chuck faces the work zone
+        const w = buildWorkUnit(g, face, levels, !moving && !work.some(x => x.stock)); w.stock = !moving;
+        machineRoot.add(w.root); machineRoot.updateMatrixWorld(true);
+        const tall = sweptBox(w.root, w.joints, m => m.userData.tall);
+        const x = face > 0 ? TB.min.x - clr - tall.max.x - side[face] : TB.max.x + clr - tall.min.x + side[face];
+        side[face] += 700;
+        w.root.position.set(x, yc - (levels * STAGE_H + CL_H), tipMid.z);
+        work.push(w);
+      });
+    }
+    machineRoot.updateMatrixWorld(true);
+  };
+  // Place, then PROVE it: sweep both sides through their extremes and test every pair of solids
+  const allJoints = () => [...tool.joints, ...work.flatMap(w => w.joints)];
+  for (; tries < 6 && !layoutOK; tries++) {
+    place();
+    const tm = meshesOf(tool.root), wm = work.flatMap(w => meshesOf(w.root));
+    layoutOK = !denseContact(allJoints(), tm, wm, machineRoot); if (!layoutOK) clr += 45;
+  }
+
+  // Frame: column / bridge behind the tool side, overarm if the work needs more throat, bed under everything
+  machineRoot.updateMatrixWorld(true);
+  setMidPose(allJoints()); machineRoot.updateMatrixWorld(true);
+  const WB = new THREE.Box3(); work.forEach(w => WB.union(sweptBox(w.root, w.joints)));
+  floorY = WB.isEmpty() ? TB.min.y - 600 : WB.min.y;
+  const FB = boxOf(tool.fixed.length ? tool.fixed.map(f => f) : [tool.root]);
+  const arm = Math.max(0, (WB.isEmpty() ? 0 : CLR + 20 - WB.min.z));
+  const fx0 = FB.min.x - 40, fx1 = FB.max.x + 40, fw = fx1 - fx0, colD = 380, zF = -arm;
+  const frame = new THREE.Group(); machineRoot.add(frame);
+  const beamH = FB.max.y - FB.min.y + 80;
+  if (arm > 0) { const a = KB(fw, beamH, arm, M.castDark); a.position.set((fx0 + fx1) / 2, (FB.min.y + FB.max.y) / 2, -arm / 2); frame.add(a); }
+  const beam = KB(fw, beamH, colD, M.castDark); beam.position.set((fx0 + fx1) / 2, (FB.min.y + FB.max.y) / 2, zF - colD / 2); frame.add(beam);
+  const legH = FB.min.y - 40 - floorY;
+  if (legH > 0) {
+    const legs = fw > 900 ? [fx0 + 150, fx1 - 150] : [(fx0 + fx1) / 2];
+    for (const x of legs) { const l = KB(fw > 900 ? 300 : Math.min(fw, 520), legH, colD, M.castDark); l.position.set(x, floorY + legH / 2, zF - colD / 2); frame.add(l); }
+    if (fw > 900) { const web = KB(fw - 600, legH * 0.55, 90, M.cast); web.position.set((fx0 + fx1) / 2, floorY + legH * 0.275, zF - colD + 45); frame.add(web); }
+  }
+  machineRoot.updateMatrixWorld(true);
+  const all = boxOf([frame, ...work.map(w => w.root)]); all.union(TB);
+  const bed = KB(all.max.x - all.min.x + 260, 220, all.max.z - all.min.z + 260, null, 'blockL');
+  bed.position.set((all.min.x + all.max.x) / 2, floorY - 110, (all.min.z + all.max.z) / 2); frame.add(bed);
+  const tray = KB(all.max.x - all.min.x + 320, 60, all.max.z - all.min.z + 320, M.cast);
+  tray.position.set(bed.position.x, floorY - 250, bed.position.z); frame.add(tray);
+
+  // Tool path, drawn in the frame of the workpiece (so it turns with a rotary table)
+  const trailFrame = turning ? work.find(w => w.stock)?.root || machineRoot : work[0]?.trailFrame || machineRoot;
+  const N = 6000, tg = new THREE.BufferGeometry(); tg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(N * 3), 3)); tg.setDrawRange(0, 0);
+  const trail = new THREE.Line(tg, new THREE.LineBasicMaterial({ color: 0xe8590c })); trail.frustumCulled = false; trail.visible = showTrail; trailFrame.add(trail);
+
+  // Sit the machine on the shop floor, centred
+  machineRoot.position.set(-bed.position.x, -(floorY - 280), -bed.position.z);
+  scene.add(machineRoot); machineRoot.updateMatrixWorld(true);
+  const size = new THREE.Box3().setFromObject(frame).union(TB.clone().translate(machineRoot.position));
+  const c = size.getCenter(new V3()), d = size.getSize(new V3()).length();
+  sun.position.set(c.x + d * 0.5, c.y + d * 0.9, c.z + d * 0.7); sun.target.position.copy(c);
+  Object.assign(sun.shadow.camera, { left: -d * 0.7, right: d * 0.7, top: d * 0.7, bottom: -d * 0.7, near: 10, far: d * 3 }); sun.shadow.camera.updateProjectionMatrix();
+  twin = { tool, work, trail, trailFrame, trailN: 0, trailMax: N, lastTip: null, layoutOK, clr, tries, centre: c, diag: d,
+           toolMeshes: meshesOf(tool.root), workMeshes: work.flatMap(w => meshesOf(w.root)),
+           cutterMeshes: meshesOf(tool.spindle), contact: false, gap: null };
+  if (firstView) { resetView(); firstView = false; }
+  for (const a of axes) if (a.cur !== null && a.node && a.role !== 'spindle') applyJoint(a, a.cur);
+}
+function resetView() {
+  if (!twin) return;
+  controls.target.copy(twin.centre);
+  camera.position.copy(twin.centre).add(new V3(0.62, 0.42, 1).normalize().multiplyScalar(twin.diag * 1.25));
+  controls.update();
+}
+
+/* =====================================================================
+   7. LIVE DATA
+   /sample returns EVERY observation since the last request, each with the agent's timestamp.
+   All axes are then played back on ONE shared clock, slightly behind live, interpolating between
+   real samples - so the axes move together exactly as the machine moved them.
+   ===================================================================== */
+let agentBase = '', deviceName = '', running = false, nextSeq = null, pollGen = 0, usePath = true;
+let clockOffset = null; const latencies = [];
+let showTrail = true, rebuildAt = 0, lastRebuild = 0;
+// Some machines report a position every 100 ms, others every few seconds. Playback runs far enough behind live
+// to always have the NEXT real sample in hand, so motion is interpolated instead of stop-and-jump.
+const gaps = []; let playDelay = PLAYBACK_DELAY, playT0 = null;
+function wantedDelay() { if (gaps.length < 6) return PLAYBACK_DELAY; const g = gaps.slice().sort((a, b) => a - b); return Math.min(9000, Math.max(PLAYBACK_DELAY, g[Math.floor(g.length * 0.9)] * 1.25 + POLL_MS + 300)); }
+
+function streamUrl(kind, q = {}) {
+  const p = new URLSearchParams(q); if (usePath) p.set('path', '//Axes');
+  const s = p.toString(); return `${agentBase}/${encodeURIComponent(deviceName)}/${kind}${s ? '?' + s : ''}`;
+}
+async function fetchStreams(kind, q) {
+  const doc = await fetchXml(streamUrl(kind, q));
+  if (doc.documentElement.localName !== 'MTConnectStreams') throw new Error(byTag(doc, 'Error')[0]?.textContent || 'agent error');
+  return doc;
+}
+function pushSample(a, t, v) {
+  const s = a.samples, last = s[s.length - 1];
+  if (last && t <= last.t) return;
+  if (a.role === 'rotary' && last) { while (v - last.v > 180) v -= 360; while (v - last.v < -180) v += 360; }   // 359 -> 1 is +2 deg, not -358
+  if (last) { const gap = t - last.t; if (gap < 8000) { gaps.push(gap); if (gaps.length > 80) gaps.shift(); }
+    if (gap > 8000) s.push({ t: t - 1500, v: last.v }); }                 // a long silence means the axis was parked: hold, then move
+  s.push({ t, v });
+  while (s.length > 2 && s[1].t < t - 30000) s.shift();
+}
+// Read a Streams document. live=true also queues the observations for playback.
+function ingest(doc, live) {
+  const byItem = {}; for (const a of axes) byItem[a.itemId] = a;
+  const now = Date.now(); let n = 0;
+  const obs = byTag(doc, '*').filter(el => byItem[el.getAttribute?.('dataItemId')]);
+  if (live) obs.sort((x, y) => (Number(x.getAttribute('sequence')) || 0) - (Number(y.getAttribute('sequence')) || 0));
+  for (const el of obs) {
+    const a = byItem[el.getAttribute('dataItemId')], text = el.textContent.trim(), v = num(text);
+    if (live) a.raw = text;
+    if (v === null) continue;                                              // UNAVAILABLE
+    const q = toQ(a, v); n++;
+    if (a.role !== 'spindle') { a.obsMin = Math.min(a.obsMin, q); a.obsMax = Math.max(a.obsMax, q); }
+    if (!live) continue;
+    const ts = Date.parse(el.getAttribute('timestamp') || ''), t = isFinite(ts) ? ts : now;
+    latencies.push(now - t); pushSample(a, t, q);
+  }
+  if (live) { while (latencies.length > 300) latencies.shift(); if (latencies.length) clockOffset = Math.min(...latencies); }
+  return n;
+}
+const header = (doc, k) => { const v = byTag(doc, 'Header')[0]?.getAttribute(k); return v == null ? null : Number(v); };
+
+// Before building anything, look through the agent's buffer to learn how far each axis really travels
+async function learnEnvelope() {
+  let cur;
+  try { cur = await fetchStreams('current'); if (!ingest(cur, false)) throw 0; }
+  catch { usePath = false; cur = await fetchStreams('current'); }
+  ingest(cur, true);
+  nextSeq = header(cur, 'nextSequence');
+  const first = header(cur, 'firstSequence'), last = header(cur, 'lastSequence');
+  if (first === null || last === null || last <= first) return 0;
+  const K = 10, got = await Promise.all(Array.from({ length: K }, (_, i) =>
+    fetchStreams('sample', { from: Math.floor(first + 5 + (last - first - 10) * i / K), count: 1500 }).then(d => ingest(d, false)).catch(() => 0)));
+  return got.reduce((s, x) => s + x, 0);
+}
+async function poll() {
+  const gen = pollGen;
+  try {
+    let doc;
+    try { doc = nextSeq !== null ? await fetchStreams('sample', { from: nextSeq, count: 4000 }) : await fetchStreams('current'); }
+    catch { nextSeq = null; doc = await fetchStreams('current'); }       // fell out of the buffer -> resync
+    if (gen !== pollGen) return;
+    const ns = header(doc, 'nextSequence'); if (ns !== null) nextSeq = ns;
+    ingest(doc, true);
+    setStatus(`Live · ${new Date().toLocaleTimeString()} · streaming ${nextSeq !== null ? '/sample' : '/current'} · shown ${(playDelay / 1000).toFixed(1)} s behind`, 'ok');
+  } catch (e) { setStatus('Agent not reachable: ' + e.message + ' — is proxy.py running?', 'err'); }
+}
+async function pollLoop(gen) {
+  while (running && gen === pollGen) { const t0 = performance.now(); await poll(); await new Promise(r => setTimeout(r, Math.max(60, POLL_MS - (performance.now() - t0)))); }
+}
+function sampleAt(a, t) {
+  const s = a.samples; if (!s.length) return null;
+  if (t <= s[0].t) return s[0].v;
+  const last = s[s.length - 1]; if (t >= last.t) return last.v;          // never extrapolate past real data
+  let i = s.length - 2; while (i > 0 && s[i].t > t) i--;
+  const p = s[i], q = s[i + 1]; return p.v + (q.v - p.v) * ((t - p.t) / (q.t - p.t));
+}
+
+/* =====================================================================
+   8. FRAME LOOP: one clock for all axes, collision watch, tool path
+   ===================================================================== */
+const clock = new THREE.Clock(); let lastCheck = 0, lastTable = 0;
+const _tw = new V3(), _b1 = new THREE.Box3(), _b2 = new THREE.Box3();
+function frame() {
+  requestAnimationFrame(frame);
+  const dt = Math.min(clock.getDelta(), 0.1), now = performance.now();
+  if (twin && running) {
+    playDelay += Math.max(-dt * 250, Math.min(dt * 250, wantedDelay() - playDelay));   // drift gently, never jump in time
+    const playT = Date.now() - (clockOffset ?? 0) - playDelay;
+    let outside = false;
+    for (const a of axes) {
+      if (!a.node || !a.samples.length) continue;
+      if (a.role === 'spindle') { a.cur = sampleAt(a, Infinity); a.spin += (a.cur / 60) * 2 * Math.PI * dt * SPIN_SCALE; a.node.quaternion.setFromAxisAngle(a.localAxis, a.spin); continue; }
+      a.cur = sampleAt(a, playT);
+      if (!a.env.full && (a.cur < a.env.lo - 0.5 || a.cur > a.env.hi + 0.5)) outside = true;
+      applyJoint(a, a.cur);
+    }
+    // An axis went further than the machine was built for: rebuild with the larger envelope (and re-prove the layout)
+    if (outside && !rebuildAt) rebuildAt = now + 300;
+    if (rebuildAt && now > rebuildAt && now - lastRebuild > 1500) { rebuildAt = 0; lastRebuild = now; buildMachine(); renderInfo(); }
+
+    machineRoot.updateMatrixWorld(true);
+    if (twin.trail.visible) {                                              // tool tip in workpiece coordinates
+      twin.tool.tip.getWorldPosition(_tw); twin.trailFrame.worldToLocal(_tw);
+      if (!twin.lastTip || twin.lastTip.distanceToSquared(_tw) > 1) {
+        const pos = twin.trail.geometry.attributes.position;
+        if (twin.trailN >= twin.trailMax) { pos.array.copyWithin(0, 3); twin.trailN--; }
+        pos.setXYZ(twin.trailN++, _tw.x, _tw.y, _tw.z); pos.needsUpdate = true; twin.trail.geometry.setDrawRange(0, twin.trailN);
+        (twin.lastTip ||= new V3()).copy(_tw);
+      }
+    }
+    if (now - lastCheck > 250) {                                           // live interference check
+      lastCheck = now;
+      twin.contact = !!anyContact(twin.toolMeshes, twin.workMeshes);
+      let gap = Infinity;
+      for (const c of twin.cutterMeshes) { _b1.setFromObject(c); for (const w of twin.workMeshes) { _b2.setFromObject(w); gap = Math.min(gap, _b1.distanceToPoint(_b2.clampPoint(_b1.getCenter(_tw), _tw))); } }
+      twin.gap = gap;
+    }
+    if (now - lastTable > 200) { lastTable = now; renderTable(); renderSafety(); }
+  }
+  controls.update();
+  renderer.render(scene, camera);
+}
+frame();
+
+/* =====================================================================
+   9. UI
+   ===================================================================== */
+function setStatus(msg, cls = 'muted') { const s = $('status'); s.textContent = msg; s.className = cls; }
+const unitLabel = a => ({ MILLIMETER: 'mm', INCH: 'in', DEGREE: '°', RADIAN: 'rad', 'REVOLUTION/MINUTE': 'rpm' }[a.units] || a.units.toLowerCase());
+const hex = k => '#' + AXIS_HEX[k].toString(16).padStart(6, '0');
+function renderTable() {
+  $('axisTable').querySelector('tbody').innerHTML = axes.map(a => {
+    const v = num(a.raw), val = a.raw === undefined ? '–' : v !== null ? v.toFixed(a.role === 'spindle' ? 0 : 3) + ' ' + unitLabel(a) : a.raw;
+    const pct = (a.cur !== null && a.env && !a.env.full && a.role !== 'spindle') ? Math.min(100, Math.max(0, (a.cur - a.env.lo) / (a.env.hi - a.env.lo) * 100)) : null;
+    const what = a.role === 'spindle' ? (a.side === 'tool' ? 'tool spindle' : 'work spindle') : a.kind === 'linear' ? 'linear' : 'rotary';
+    const travel = a.role === 'spindle' ? '' : a.env?.full ? ' · full turn' : a.env ? ` · travel ${(a.env.hi - a.env.lo).toFixed(0)}${a.kind === 'linear' ? ' mm' : '°'} (${a.env.src})` : '';
+    return `<tr><td><span class="swatch" style="background:${hex(a.k)}"></span><b>${a.name}</b>
+      <div class="muted">${what} along machine ${a.u[a.k] < 0 ? '−' : ''}${a.letter} (${a.vecSource})${a.gain !== 1 && a.kind === 'linear' ? ' ×' + a.gain : ''} · moves the ${a.side === 'tool' ? 'tool' : 'work'}${a.parentAxis ? ' · on ' + a.parentAxis.name : ''}<br>
+      ${a.itemId} · ${a.itemType}${a.csName ? ' · ' + a.csName + (a.csType ? ' [' + a.csType + ']' : '') : ''}${travel}</div>
+      ${pct !== null ? `<div class="bar"><i style="left:calc(${pct}% - 1px)"></i></div>` : ''}</td>
+      <td class="val">${val}${a.kind === 'linear' && a.cur !== null && (a.offset || a.gain !== 1) ? `<div class="muted">${a.cur.toFixed(1)} mm from base</div>` : ''}</td></tr>`;
+  }).join('') || '<tr><td class="muted">No axes found in the probe</td></tr>';
+}
+function renderSafety() {
+  if (!twin) return;
+  $('safety').innerHTML = `<span>Layout proof</span><span class="${twin.layoutOK ? 'ok' : 'err'}">${twin.layoutOK ? 'no contact anywhere in the travel sweep' : 'could not clear all extremes'}</span>
+    <span>Live check</span><span class="${twin.contact ? 'err' : 'ok'}">${twin.contact ? 'CONTACT between tool side and work side' : 'clear'}</span>
+    <span>Tool to work</span><span>${twin.gap === null || !isFinite(twin.gap) ? '–' : twin.gap.toFixed(0) + ' mm'}</span>`;
+}
+function renderInfo(deviceEl) {
+  const n = r => axes.filter(a => a.role === r).length;
+  const tr = axes.filter(a => a.role === 'rotary' && a.side === 'tool').length, pr = axes.filter(a => a.role === 'rotary' && a.side === 'part').length;
+  const cfg = (tr + pr === 0 ? 'no rotary axes' : tr && pr ? 'head / table (rotary on both sides)' : tr ? 'head / head (rotaries on the spindle head)' : 'table / table (rotaries under the work)');
+  $('deviceInfo').innerHTML = `<span>Device</span><span>${deviceName}</span>
+    <span>Axes</span><span>${n('linear')} linear, ${n('rotary')} rotary, ${n('spindle')} spindle</span>
+    <span>Type</span><span>${sides.turning ? 'turning / mill-turn (work held in a spindle)' : 'machining centre'}</span>
+    <span>Rotary layout</span><span>${cfg}</span>
+    <span>Chain</span><span>${sides.tool.map(a => a.name).join(' → ') || '–'} <span class="muted">(tool)</span><br>${sides.partGroups.map(g => g.map(a => a.name).join(' → ')).join('<br>') || '–'} <span class="muted">(work)</span></span>
+    <span>Layout from</span><span>${sides.mode}</span>`;
+  renderTable(); renderSafety();
+}
+function describeCoords(deviceEl) {
+  const cs = Object.values(coordSystems(deviceEl));
+  const used = [...new Set(axes.map(a => a.csName).filter(Boolean))];
+  return (cs.length ? cs.map(c => `${c.id} [${c.type}]${c.parent ? ' in ' + c.parent : ''}${c.t.some(v => v) ? ' @ ' + c.t.join(', ') : ''}`).join('<br>') : 'None declared: positions taken as machine coordinates')
+    + (used.length ? `<br>Twin positions use: ${used.join(', ')}` : '');
+}
+
+let probeDoc = null;
+async function connect(reloadProbe) {
+  running = false; pollGen++; nextSeq = null; latencies.length = 0; clockOffset = null; usePath = true; gaps.length = 0; playDelay = PLAYBACK_DELAY;
+  try {
+    const base = $('agentUrl').value.replace(/\/+$/, '');
+    if (reloadProbe || !probeDoc || base !== agentBase) {
+      agentBase = base; setStatus('Reading probe…');
+      probeDoc = await fetchXml(`${agentBase}/probe`);
+      const devices = byTag(probeDoc, 'Device'), sel = $('deviceSel');
+      sel.innerHTML = devices.map(d => `<option>${d.getAttribute('name')}</option>`).join('');
+      const wanted = params.get('device'); if (wanted && devices.some(d => d.getAttribute('name') === wanted)) sel.value = wanted;
+    }
+    deviceName = $('deviceSel').value;
+    const deviceEl = byTag(probeDoc, 'Device').find(d => d.getAttribute('name') === deviceName);
+    if (!deviceEl) throw new Error('device not in probe');
+    axes = discover(deviceEl); sides = assignSides(axes);
+    setStatus('Learning axis travel from the agent buffer…');
+    await learnEnvelope();
+    firstView = true; buildMachine();
+    $('coordInfo').innerHTML = describeCoords(deviceEl); renderInfo(deviceEl);
+    const u = new URL(location); u.searchParams.set('device', deviceName); history.replaceState(null, '', u);
+    running = true; pollLoop(pollGen);
+  } catch (e) { setStatus('Error: ' + e.message + ' — is proxy.py running?', 'err'); console.error(e); }
+}
+$('connectBtn').onclick = () => connect(true);
+$('deviceSel').onchange = () => connect(false);
+$('viewBtn').onclick = resetView;
+$('trailBtn').onclick = () => { showTrail = !showTrail; $('trailBtn').textContent = 'Tool path: ' + (showTrail ? 'on' : 'off'); if (twin) { twin.trail.visible = showTrail; twin.trailN = 0; twin.trail.geometry.setDrawRange(0, 0); } };
+addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+
+// For debugging / testing from the console
+window.twin = { get axes() { return axes; }, get state() { return twin; }, get root() { return machineRoot; }, get sides() { return sides; }, THREE,
+  stop() { running = false; pollGen++; }, applyJoint, forEachPose, anyContact, meshesOf };
+connect(true);
+</script>
+</body>
+</html>
